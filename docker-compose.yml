@@ -1,0 +1,31 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Auth is on by default. Set to "false" for a key-less demo.
+      DOCCHAT_AUTH_ENABLED: "true"
+      # IMPORTANT: change this in production.
+      DOCCHAT_SECRET_KEY: "please-change-me"
+      # Embeddings: tfidf | openai | local
+      DOCCHAT_EMBEDDING_PROVIDER: "tfidf"
+      # LLM: none | ollama | openai
+      DOCCHAT_LLM_PROVIDER: "none"
+      # If using ollama on the host machine from inside docker:
+      #DOCCHAT_LLM_PROVIDER: "ollama"
+      #DOCCHAT_OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      # If using an OpenAI-compatible API:
+      #DOCCHAT_LLM_PROVIDER: "openai"
+      #DOCCHAT_OPENAI_API_KEY: "sk-..."
+      #DOCCHAT_EMBEDDING_PROVIDER: "openai"
+    volumes:
+      - docchat_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  docchat_data:

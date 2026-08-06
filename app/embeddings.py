@@ -6,20 +6,14 @@ a vector — a list of numbers — such that texts about similar topics end up w
 similar vectors. Then "find relevant text" becomes "find the nearest vectors",
 which is just geometry.
 
-Here we use TF-IDF (Term Frequency - Inverse Document Frequency), a classic,
-transparent way to build those vectors:
+docchat ships with three embedding backends behind one interface:
 
-  - Term Frequency: words that appear a lot in a chunk are important *to that chunk*.
-  - Inverse Document Frequency: words that appear in *every* chunk (like "the")
-    are not distinctive, so we down-weight them.
+  tfidf   -> classic, transparent, fully offline (default)
+  openai  -> cloud embeddings via any OpenAI-compatible /embeddings endpoint
+  local   -> sentence-transformers running on your own machine (offline neural)
 
-Real systems swap TF-IDF for a neural "embedding model" that captures meaning
-(so "car" and "automobile" score as similar). We deliberately don't, because:
-  (a) it needs no downloads and runs instantly, and
-  (b) you can read every line and see exactly why a result was returned.
-
-The `Embedder` interface below is the seam where you'd plug in a real model
-later (e.g. sentence-transformers) without changing anything else.
+The `Embedder` interface is the seam: swap the backend with
+DOCCHAT_EMBEDDING_PROVIDER and nothing else in the app changes.
 """
 
 from __future__ import annotations
@@ -29,7 +23,10 @@ import re
 from collections import Counter
 from typing import Protocol
 
+import httpx
 import numpy as np
+
+from .config import settings
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -40,11 +37,9 @@ def tokenize(text: str) -> list[str]:
 
 
 class Embedder(Protocol):
-    """Anything that can turn text into fixed-meaning vectors.
+    """Anything that can turn text into fixed-meaning vectors."""
 
-    Swap this out for a neural embedding model and the rest of the app is
-    unchanged — that's the whole point of coding to an interface.
-    """
+    name: str
 
     def fit(self, corpus: list[str]) -> None: ...
     def transform(self, texts: list[str]) -> np.ndarray: ...
@@ -59,20 +54,20 @@ class TfidfEmbedder:
     product later — one less thing to get wrong.
     """
 
+    name = "tfidf"
+
     def __init__(self, min_df: int = 1):
         self.min_df = min_df
         self.vocab: dict[str, int] = {}
         self.idf: np.ndarray | None = None
 
     def fit(self, corpus: list[str]) -> None:
-        # Count in how many documents each term appears (document frequency).
         doc_freq: Counter[str] = Counter()
         tokenized_docs = [tokenize(doc) for doc in corpus]
         for tokens in tokenized_docs:
             for term in set(tokens):
                 doc_freq[term] += 1
 
-        # Build the vocabulary, dropping ultra-rare terms if min_df > 1.
         self.vocab = {
             term: i
             for i, term in enumerate(
@@ -83,7 +78,6 @@ class TfidfEmbedder:
         n_docs = max(len(corpus), 1)
         idf = np.zeros(len(self.vocab), dtype=np.float64)
         for term, idx in self.vocab.items():
-            # Smoothed IDF: rarer term -> higher weight.
             idf[idx] = math.log((1 + n_docs) / (1 + doc_freq[term])) + 1.0
         self.idf = idf
 
@@ -100,11 +94,95 @@ class TfidfEmbedder:
             for term, count in counts.items():
                 idx = self.vocab.get(term)
                 if idx is None:
-                    continue  # a word we've never seen — ignore it
+                    continue
                 tf = count / total
                 vectors[row, idx] = tf * self.idf[idx]
 
-        # L2-normalise each row so cosine similarity == dot product.
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return vectors / norms
+
+
+class OpenAIEmbedder:
+    """Cloud embeddings through any OpenAI-compatible `/embeddings` endpoint.
+
+    `fit()` is a no-op — cloud models need no corpus training — which is why
+    a persistent index matters: we store the vectors so restarts don't
+    re-bill you for the same documents.
+    """
+
+    name = "openai"
+
+    def __init__(
+        self,
+        api_key: str = settings.openai_api_key,
+        base_url: str = settings.openai_base_url,
+        model: str = settings.embedding_model,
+    ):
+        if not api_key:
+            raise ValueError("DOCCHAT_OPENAI_API_KEY is required for openai embeddings")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def fit(self, corpus: list[str]) -> None:
+        return None
+
+    def transform(self, texts: list[str]) -> np.ndarray:
+        vectors: list[np.ndarray] = []
+        # Batch in chunks of 100 to stay under typical request limits.
+        for start in range(0, len(texts), 100):
+            batch = texts[start : start + 100]
+            resp = httpx.post(
+                f"{self.base_url}/embeddings",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={"model": self.model, "input": batch},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()["data"]
+            data.sort(key=lambda d: d["index"])
+            vectors.extend(np.array(d["embedding"], dtype=np.float64) for d in data)
+
+        matrix = np.vstack(vectors) if vectors else np.zeros((0, 0))
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return matrix / norms
+
+
+class LocalEmbedder:
+    """Offline neural embeddings via sentence-transformers.
+
+    Imported lazily so the heavy torch dependency is only loaded when this
+    provider is actually selected. Install extras first:
+        pip install -r requirements-optional.txt
+    """
+
+    name = "local"
+
+    def __init__(self, model: str = "all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer  # lazy import
+
+        self._model = SentenceTransformer(model)
+
+    def fit(self, corpus: list[str]) -> None:
+        return None
+
+    def transform(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, 0))
+        return self._model.encode(texts, normalize_embeddings=True)
+
+
+def build_embedder() -> Embedder:
+    """Instantiate the embedder selected by DOCCHAT_EMBEDDING_PROVIDER."""
+    provider = settings.embedding_provider.lower()
+    if provider == "tfidf":
+        return TfidfEmbedder()
+    if provider == "openai":
+        return OpenAIEmbedder()
+    if provider == "local":
+        return LocalEmbedder()
+    raise ValueError(
+        f"Unknown embedding provider {provider!r}; choose tfidf | openai | local"
+    )

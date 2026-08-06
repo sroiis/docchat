@@ -4,20 +4,27 @@ RAG = Retrieval-Augmented Generation. In a full system the flow is:
 
     question -> RETRIEVE relevant chunks -> feed them to an LLM -> GENERATE answer
 
-This build is "retrieval-only" (you chose the fully-offline option), so we stop
-after retrieval and return the best chunks *as* the answer, each with its source
-and a confidence score. That's genuinely useful on its own, and it's the half of
-RAG that backend engineers actually own — the LLM is just an optional last step
-you could bolt on (see README for how).
+This build does both halves:
+
+  - retrieval: chunking + embeddings + nearest-neighbour search (the original
+    docchat core), and
+  - generation: an optional LLM step (Ollama or any OpenAI-compatible API)
+    that writes a fluent answer grounded in the retrieved chunks.
+
+The engine is per-user: each user has their own embedder, vector store and
+persistent index in the database. Everything below is user-scoped.
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
-from .chunking import chunk_text
-from .embeddings import Embedder, TfidfEmbedder
+import numpy as np
+
+from . import db
+from .chunking import Chunk, chunk_text
+from .embeddings import Embedder, build_embedder
+from .generator import Generator, build_generator
 from .store import VectorStore
 
 
@@ -30,74 +37,126 @@ class Answer:
 
 
 class RagEngine:
-    """Owns the embedder + store and exposes ingest/ask.
+    """Owns the embedder + store + generator for a single user.
 
-    One instance is created at app startup and shared across requests. It's
-    read-mostly after ingest, so this is safe for the simple single-process
-    server we run here.
+    An instance is created per user and cached; it is rebuilt whenever the
+    user's index changes (ingest or delete).
     """
 
     def __init__(self, embedder: Embedder | None = None) -> None:
-        self.embedder: Embedder = embedder or TfidfEmbedder()
+        self.embedder: Embedder = embedder or build_embedder()
         self.store = VectorStore()
+        self.generator: Generator | None = None
+        self.last_answer: Answer | None = None
         self._fitted = False
 
-    # ---- ingest -----------------------------------------------------------
+    # ---- index lifecycle ---------------------------------------------------
 
-    def ingest_texts(self, docs: dict[str, str]) -> int:
-        """Index a mapping of {doc_id: full_text}. Returns chunk count.
+    def load(self, user_id: int) -> None:
+        """Restore a user's index from the persistent database."""
+        rows = db.load_chunks(user_id)
+        if not rows:
+            self.store.reset()
+            self._fitted = False
+            return
 
-        Note: TF-IDF must see the whole corpus to compute IDF, so we (re)fit on
-        every ingest. That's fine for a local tool with a handful of docs. A
-        neural embedder wouldn't need refitting — another reason the interface
-        is nice.
+        chunks = [
+            Chunk(doc_id=r["doc_id"], chunk_id=r["chunk_id"],
+                  text=r["text"], order=r["order"])
+            for r in rows
+        ]
+        vectors = np.vstack([r["vector"] for r in rows])
+        self._fit_if_needed(chunks)
+        self.store.add(chunks, vectors)
+        self._fitted = True
+
+    def ingest_texts(self, user_id: int, docs: dict[str, str]) -> int:
+        """Index a mapping of {doc_id: full_text} for a user. Returns chunk count.
+
+        A user's whole corpus is re-chunked and re-embedded on each ingest so
+        TF-IDF sees the complete vocabulary (it must to compute IDF). For
+        neural embedders this is still consistent, just slightly wasteful for
+        large corpora — acceptable at this scale.
         """
-        chunks = []
         for doc_id, text in docs.items():
-            chunks.extend(chunk_text(doc_id, text))
+            if text is None or not text.strip():
+                continue
+            db.add_document(user_id, doc_id, file_name=doc_id, content=text)
 
+        # Rebuild the index from every stored document, including the new ones.
+        all_docs = db.list_all_docs(user_id)
+
+        chunks: list[Chunk] = []
+        for doc_id, text in all_docs.items():
+            chunks.extend(chunk_text(doc_id, text))
         if not chunks:
+            db.replace_chunks(user_id, [])
             self.store.reset()
             self._fitted = False
             return 0
 
-        corpus = [c.text for c in chunks]
-        self.embedder.fit(corpus)
-        vectors = self.embedder.transform(corpus)
+        texts = [c.text for c in chunks]
+        self._fit_if_needed(chunks)
+        vectors = self.embedder.transform(texts)
         self.store.add(chunks, vectors)
+        db.replace_chunks(
+            user_id,
+            [
+                {
+                    "doc_id": c.doc_id,
+                    "chunk_id": c.chunk_id,
+                    "order": c.order,
+                    "text": c.text,
+                    "vector": v,
+                }
+                for c, v in zip(chunks, vectors)
+            ],
+        )
         self._fitted = True
         return len(chunks)
 
-    def ingest_directory(self, path: str) -> int:
-        """Read every .md/.txt file under `path` and index it."""
+    def ingest_directory(self, user_id: int, path: str) -> int:
+        """Read every .md/.txt file under `path` and index it for the user."""
+        import os
+
         docs: dict[str, str] = {}
         for root, _dirs, files in os.walk(path):
             for name in files:
                 if not name.lower().endswith((".md", ".txt")):
                     continue
                 full = os.path.join(root, name)
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                with open(full, encoding="utf-8", errors="replace") as fh:
                     docs[name] = fh.read()
-        return self.ingest_texts(docs)
+        return self.ingest_texts(user_id, docs)
 
-    # ---- query ------------------------------------------------------------
+    def delete_document(self, user_id: int, doc_id: str) -> bool:
+        """Remove a document and rebuild the index without it."""
+        removed = db.delete_document(user_id, doc_id)
+        if not removed:
+            return False
+        self.load(user_id)
+        return True
 
-    def ask(self, question: str, k: int = 4) -> Answer:
+    def documents(self, user_id: int) -> list[dict]:
+        return db.list_documents(user_id)
+
+    # ---- embedding helper ---------------------------------------------------
+
+    def _fit_if_needed(self, chunks: list[Chunk]) -> None:
+        """TF-IDF needs a corpus fit; neural embedders ignore it."""
+        fit = getattr(self.embedder, "fit", None)
+        if fit is not None:
+            fit([c.text for c in chunks])
+
+    # ---- query -------------------------------------------------------------
+
+    def retrieve(self, question: str, k: int = 4) -> list[dict]:
+        """Return the top-k most relevant chunks with scores."""
         if not self._fitted or self.store.size == 0:
-            return Answer(question=question, answer="No documents indexed yet. "
-                          "Ingest some docs first (POST /ingest).",
-                          sources=[], confidence=0.0)
-
+            return []
         query_vec = self.embedder.transform([question])[0]
         hits = self.store.search(query_vec, k=k)
-
-        if not hits:
-            return Answer(question=question,
-                          answer="I couldn't find anything relevant in the "
-                                 "indexed documents for that question.",
-                          sources=[], confidence=0.0)
-
-        sources = [
+        return [
             {
                 "doc_id": h.chunk.doc_id,
                 "chunk_id": h.chunk.chunk_id,
@@ -106,15 +165,75 @@ class RagEngine:
             }
             for h in hits
         ]
-        # The "answer" is a readable synthesis: lead with the strongest chunk.
-        best = hits[0]
-        answer = (
-            f"Based on '{best.chunk.doc_id}' (relevance {best.score:.0%}):\n\n"
-            f"{best.chunk.text}"
-        )
-        return Answer(
+
+    def ask(self, user_id: int, question: str, k: int = 4) -> Answer:
+        """Retrieve, then generate (if an LLM is configured)."""
+        self.load(user_id)
+        sources = self.retrieve(question, k)
+        if not sources:
+            answer = Answer(
+                question=question,
+                answer="No documents indexed yet. "
+                       "Ingest some docs first (POST /ingest).",
+                sources=[],
+                confidence=0.0,
+            )
+            self.last_answer = answer
+            return answer
+
+        best = sources[0]
+        answer = Answer(
             question=question,
-            answer=answer,
+            answer=f"Based on '{best['doc_id']}' (relevance {best['score']:.0%}):\n\n"
+                   f"{best['text']}",
             sources=sources,
-            confidence=round(best.score, 4),
+            confidence=best["score"],
         )
+        self.last_answer = answer
+        return answer
+
+    async def stream_answer(
+        self, user_id: int, question: str, k: int = 4
+    ) -> dict:
+        """Retrieve sources and set up generation for streaming.
+
+        Returns {"sources": [...], "generator": Generator} — the HTTP layer
+        builds the prompt and streams tokens.
+        """
+        self.load(user_id)
+        sources = self.retrieve(question, k)
+        if not sources:
+            return {"sources": [], "generator": None}
+
+        best = sources[0]
+        self.last_answer = Answer(
+            question=question,
+            answer=f"Based on '{best['doc_id']}' (relevance {best['score']:.0%}):\n\n"
+                   f"{best['text']}",
+            sources=sources,
+            confidence=best["score"],
+        )
+        if self.generator is None:
+            self.generator = build_generator(self)
+        return {"sources": sources, "generator": self.generator}
+
+    @staticmethod
+    def build_prompt(question: str, sources: list[dict]) -> tuple[str, str]:
+        """Turn retrieved chunks into system + user prompts for the LLM."""
+        system = (
+            "You are docchat, a precise Q&A assistant. Answer the user's "
+            "question using ONLY the provided excerpts. If the excerpts do not "
+            "contain the answer, say you couldn't find it. Cite the source "
+            "filename of each fact you use, e.g. (source: architecture.md). "
+            "Be concise and factual."
+        )
+        context = "\n\n".join(
+            f"[{i + 1}] (source: {s['doc_id']})\n{s['text']}"
+            for i, s in enumerate(sources)
+        )
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Relevant excerpts:\n{context}\n\n"
+            f"Answer the question using the excerpts above."
+        )
+        return system, user_prompt

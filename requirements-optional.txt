@@ -1,0 +1,3 @@
+# Optional extras: offline neural embeddings (heavy deps).
+# Install with:  pip install -r requirements-optional.txt
+sentence-transformers>=3.0
