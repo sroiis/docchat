@@ -83,9 +83,7 @@ def health() -> dict:
 
 def _user_count() -> int:
     try:
-        with db._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-        return int(row["n"]) if row else 0
+        return db.count_users()
     except Exception:
         return 0
 

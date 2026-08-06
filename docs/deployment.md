@@ -3,6 +3,22 @@
 docchat ships ready to run anywhere a Docker container can run, and the
 frontend is served by the same process as the API (one container, one port).
 
+The database is portable: SQLite locally, Postgres in production, chosen by
+`DOCCHAT_DATABASE_URL`. See [Database](#database) below.
+
+## Deploy free on Render (recommended for "anyone can use")
+
+[render.yaml](../render.yaml) provisions a free web service + free Postgres.
+No credit card. Three steps:
+
+1. Push this repo to GitHub (public).
+2. On Render: **New → Blueprint** → connect the repo.
+3. Render creates the Postgres DB, wires `DOCCHAT_DATABASE_URL`, and deploys.
+
+Free-tier caveats: the web service **sleeps after 15 min idle** (first visit
+cold-starts in ~30–60 s), and the free Postgres **expires after 90 days**
+(delete + recreate the DB to refresh, or upgrade).
+
 ## Quick local start (Docker)
 
 ```bash
@@ -36,6 +52,7 @@ All settings are environment variables with the `DOCCHAT_` prefix. See
 |----------|---------|---------|
 | `DOCCHAT_AUTH_ENABLED` | `true` | Turn off for a key-less demo |
 | `DOCCHAT_SECRET_KEY` | dev value | **Change in production** — signs JWTs |
+| `DOCCHAT_DATABASE_URL` | (none) | Set to a Postgres URL to use Postgres; empty = SQLite at `DOCCHAT_DB_PATH` |
 | `DOCCHAT_EMBEDDING_PROVIDER` | `tfidf` | `tfidf` \| `openai` \| `local` |
 | `DOCCHAT_LLM_PROVIDER` | `none` | `none` \| `ollama` \| `openai` |
 | `DOCCHAT_LLM_MODEL` | `llama3.1` | Model used for generation |
@@ -78,30 +95,53 @@ LM Studio, local vLLM…) works.
 
 ## Production deployment
 
-### Deploying to Render
+### Deploying to Render (Blueprint)
+The recommended path — see the top of this page. Render's `render.yaml`
+creates a free Postgres and wires `DOCCHAT_DATABASE_URL` automatically, so
+data survives restarts (no mounted disk needed).
+
+### Deploying to Render (manual Web Service)
 1. Push the repo to GitHub.
 2. On Render, create a **Web Service**, connect the repo.
 3. Build command: `docker build -t docchat .` (Render supports the Dockerfile
    automatically when present).
 4. Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-5. Add env vars: a real `DOCCHAT_SECRET_KEY`, and a mounted disk at
-   `/app/data` with `DOCCHAT_DB_PATH=/app/data/docchat.db` so the index
-   survives restarts.
-6. Set `DOCCHAT_ALLOWED_ORIGINS` to your app's public URL.
+5. Create a **Postgres** database in Render and set
+   `DOCCHAT_DATABASE_URL` to its internal connection string.
+6. Add env vars: a real `DOCCHAT_SECRET_KEY`, `DOCCHAT_EMBEDDING_PROVIDER=tfidf`,
+   `DOCCHAT_LLM_PROVIDER=none` (or `ollama`/`openai`).
+7. Set `DOCCHAT_ALLOWED_ORIGINS` to your app's public URL.
 
 ### Deploying to Fly.io
 `flyctl launch` will detect the Dockerfile. Configure secrets:
 ```bash
 fly secrets set DOCCHAT_SECRET_KEY="$(openssl rand -hex 32)"
 fly secrets set DOCCHAT_LLM_PROVIDER=ollama   # if you add an Ollama machine
-fly volume create docchat_data --size 1
-# set DOCCHAT_DB_PATH=/data/docchat.db and mount the volume at /data
+fly postgres create --name docchat-db
+fly secrets set DOCCHAT_DATABASE_URL="<connection string from fly postgres>"
 ```
 
-### Any platform with a persistent volume
-The same pattern everywhere: persist `DOCCHAT_DB_PATH`, set a real
-`DOCCHAT_SECRET_KEY`, keep `DOCCHAT_AUTH_ENABLED=true`. If you need multiple
-instances, move storage to Postgres + a real vector DB (see architecture notes).
+### Any platform with Postgres
+Set `DOCCHAT_DATABASE_URL` to any Postgres, `DOCCHAT_SECRET_KEY` to a long
+random string, keep `DOCCHAT_AUTH_ENABLED=true`. Multiple instances share one
+database safely.
+
+## Database
+
+The app is portable across SQLite and Postgres through one table-definition
+layer (`app/db.py`):
+
+- **Local dev / small self-hosts:** nothing to configure — SQLite is used at
+  `DOCCHAT_DB_PATH` (default `data/docchat.db`).
+- **Production:** set `DOCCHAT_DATABASE_URL` to a Postgres URL, e.g.
+  `postgresql://user:pass@host:5432/docchat`. Tables are created on startup.
+
+`postgres://` URLs (as Render/Fly emit) are normalised automatically. Install
+the Postgres driver in production: `pip install -r requirements-prod.txt`
+(the Docker image already includes it).
+
+Chunks and their embedding vectors are stored as rows, so a restart restores
+every user's index without recomputing embeddings.
 
 ## CI
 

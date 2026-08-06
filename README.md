@@ -138,8 +138,10 @@ The suite doubles as documentation for each component. CI runs lint
 
 ## Deployment
 
-See **[docs/deployment.md](docs/deployment.md)** — Docker, Render, Fly.io, and
-production checklist (persistent volume, real secret key, health checks).
+See **[docs/deployment.md](docs/deployment.md)** — one-click free deploy on
+Render (web service + Postgres, no credit card), Docker, Fly.io, and the
+production checklist. The database is portable: SQLite locally, Postgres in
+production (`DOCCHAT_DATABASE_URL`).
 
 ## Architecture
 

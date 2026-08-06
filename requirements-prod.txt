@@ -1,0 +1,3 @@
+# Production dependencies (Postgres driver). Install these in deployment:
+#   pip install -r requirements.txt -r requirements-prod.txt
+psycopg2-binary>=2.9

@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     version: str = "2.0.0"
     data_dir: str = "data"
     db_path: str = "data/docchat.db"
+    # Full database URL. When set, it wins over db_path. Supports SQLite
+    # (sqlite:///path) and Postgres (postgresql://user:pass@host/db), so the
+    # same code runs locally on SQLite and in production on Postgres.
+    database_url: str = ""
 
     # --- auth ---------------------------------------------------------------
     # Set DOCCHAT_AUTH_ENABLED=false for a quick local demo without logins.
