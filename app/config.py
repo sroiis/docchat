@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     default_k: int = 4
     words_per_chunk: int = 120
     chunk_overlap: int = 30
+    # How to combine the sparse (BM25) and dense (neural vector) retrievers:
+    #   "hybrid" -> fuse BM25 + dense with RRF (falls back to dense-only
+    #               when the embedder is TF-IDF, since that IS lexical)
+    #   "sparse" -> BM25 only
+    #   "dense"  -> vector store only
+    search_mode: str = "hybrid"
 
     # --- docs / indexing ----------------------------------------------------
     docs_dir: str = "sample_docs"

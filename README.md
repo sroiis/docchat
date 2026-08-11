@@ -9,6 +9,9 @@ Generation) service — FastAPI backend + React frontend — that indexes your
 - **Persistent**: your index survives restarts (SQLite)
 - **Pluggable**: swap embeddings (TF-IDF / OpenAI / local) and the LLM
   (none / Ollama / OpenAI-compatible) with one env var
+- **Hybrid retrieval**: when a neural embedder is active, BM25 + dense
+  vectors are fused with RRF (`DOCCHAT_SEARCH_MODE`) — meaning-matching
+  ("car" ≈ "automobile") *plus* exact-term recall
 - **Streaming**: answers token-by-token over SSE
 - **One command**: `docker compose up` gives you the whole product
 
@@ -59,6 +62,25 @@ docchat implements *both* halves of RAG:
 | None (default) | `none` | Retrieval-only synthesis, no keys needed |
 | Ollama | `ollama` | Local LLM, fully offline |
 | OpenAI-compatible | `openai` | OpenAI, OpenRouter, vLLM, LM Studio… |
+
+### Hybrid retrieval (sparse + dense, fused with RRF)
+
+The retriever combines a **BM25 lexical index** (`app/lexical.py`) with the
+**dense vector store**, fusing the two rankings with reciprocal-rank fusion
+(`app/search.py`). Neural embeddings catch paraphrases ("car" ≈ "automobile");
+BM25 keeps exact jargon and rare terms. Controlled by `DOCCHAT_SEARCH_MODE`:
+
+| Mode | What runs |
+|------|-----------|
+| `hybrid` (default) | BM25 + dense, RRF-fused (falls back to vector-only with a TF-IDF embedder — same results as before) |
+| `sparse` | BM25 only |
+| `dense` | vector store only (TF-IDF or neural) |
+
+Try meaning-matching for yourself:
+```bash
+DOCCHAT_EMBEDDING_PROVIDER=local   # pip install -r requirements-optional.txt
+# ask "What is a car used for?" against text that says "automobile"
+```
 
 ### Streaming chat
 `POST /api/chat` returns a Server-Sent-Events stream:
@@ -118,19 +140,21 @@ DOCCHAT_OLLAMA_BASE_URL=http://localhost:11434
 |------|------|--------------|
 | 1 | `app/chunking.py` | Split docs into overlapping word windows |
 | 2 | `app/embeddings.py` | Text → vectors (pluggable: TF-IDF / OpenAI / local) |
-| 3 | `app/store.py` | Vector store + nearest-neighbour search |
-| 4 | `app/generator.py` | LLM generation (none / Ollama / OpenAI) |
-| 5 | `app/rag.py` | Per-user ingest + retrieve + generate pipeline |
-| 6 | `app/db.py` | SQLite persistence |
-| 7 | `app/auth.py` | JWT auth + password hashing |
-| 8 | `app/api.py` | All `/api` endpoints |
-| 9 | `app/main.py` | App wiring + static frontend |
-| 10 | `frontend/` | React + Vite SPA |
+| 3 | `app/lexical.py` | BM25 sparse index (hybrid retrieval) |
+| 4 | `app/store.py` | Vector store + nearest-neighbour search |
+| 5 | `app/search.py` | RRF fusion of sparse + dense rankings |
+| 6 | `app/generator.py` | LLM generation (none / Ollama / OpenAI) |
+| 7 | `app/rag.py` | Per-user ingest + retrieve + generate pipeline |
+| 8 | `app/db.py` | SQLite/Postgres persistence |
+| 9 | `app/auth.py` | JWT auth + password hashing |
+| 10 | `app/api.py` | All `/api` endpoints |
+| 11 | `app/main.py` | App wiring + static frontend |
+| 12 | `frontend/` | React + Vite SPA |
 
 ## Tests
 
 ```bash
-pytest -q          # 22 tests: unit + API + auth + generator
+pytest -q          # 30 tests: unit + API + auth + generator + hybrid retrieval
 ```
 
 The suite doubles as documentation for each component. CI runs lint

@@ -71,6 +71,15 @@ paid API calls.
 the default. Swap in `openai` or `local` (sentence-transformers) via one env
 var; the interface makes the change invisible to the rest of the system.
 
+### Hybrid retrieval (BM25 + dense, RRF)
+TF-IDF is *lexical* — it matches words, not meaning. To fix the "car" vs
+"automobile" gap, retrieval is now **hybrid** (`app/lexical.py`,
+`app/search.py`): a BM25 sparse index runs alongside the dense vector store,
+and their rankings are fused with reciprocal rank fusion (RRF, k=60). With a
+neural embedder active this gives meaning-matching plus exact-term recall;
+with TF-IDF it degrades to vector-only, so the default is unchanged.
+`DOCCHAT_SEARCH_MODE=hybrid|sparse|dense` controls the path.
+
 ### Generation is a bolt-on
 `llm_provider=none` returns a retrieval-only synthesis, so the whole product
 works offline with no keys. `ollama` runs a local LLM; `openai` targets any
@@ -92,7 +101,7 @@ both are easy to audit.
 ```sql
 users      (id, email UNIQUE, password_hash, created_at)
 documents  (id, user_id→users, doc_id, file_name, content, created_at)
-chunks     (id, user_id→users, doc_id, chunk_id, "order", text, vector BLOB)
+chunks     (id, user_id→users, doc_id, chunk_id, pos, text, vector BLOB)
 ```
 
 `documents.content` holds the source text (needed to re-chunk and re-fit

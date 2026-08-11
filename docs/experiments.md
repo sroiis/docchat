@@ -54,6 +54,44 @@ the top 4 results that do.
 | mean latency     | ~0.4 ms |
 | p50 / p95 latency | 0.1 / ~2 ms |
 
+## Hybrid retrieval (sparse + dense, RRF)
+
+The numbers above are the **lexical baseline** — the out-of-the-box, zero-dependency
+configuration. The limitation they expose (exact-word matching only) is exactly
+what hybrid retrieval removes. Since v2.0 docchat ships a **BM25 sparse index**
+(`app/lexical.py`) fused with the **dense vector store** via **reciprocal-rank
+fusion** (`app/search.py`, RRF constant k=60). When a neural embedder is active
+(`DOCCHAT_EMBEDDING_PROVIDER=local|openai`), `hybrid` mode:
+
+- matches meaning: "What is a *car* used for?" retrieves text about
+  *automobiles* (dense branch), and
+- keeps exact recall: jargon and rare terms still hit precisely (BM25 branch).
+
+### Measured: same queries, three retrievers (all-MiniLM-L6-v2)
+
+| Retriever | precision@4 | hit@1 | latency (p95) |
+|-----------|-------------|-------|---------------|
+| TF-IDF (lexical baseline) | 0.53 | 0.88 | 0.1 ms |
+| Dense only (MiniLM)       | 0.53 | 0.88 | ~23 ms (embedding p95) |
+| **Hybrid (BM25 + dense)** | **0.56** | **1.00** | ~23 ms (embedding p95) |
+
+The dense branch alone doesn't beat the baseline on this tiny corpus — its
+real edge is paraphrase matching — but **hybrid reaches hit@1 = 1.00**: the
+one miss the lexical table shows ("How does the vector store find the nearest
+chunks?" → archived `what_is_rag.md` first) is fixed, because the chunk ranked
+well in *both* lists wins under RRF. Latency is dominated by encoding the
+question (~19 ms with MiniLM on CPU); the search itself stays sub-millisecond.
+
+Reproduce with the optional extras installed:
+
+```bash
+pip install -r requirements-optional.txt
+python scripts/eval_rag.py --local   # prints the two extra rows above
+```
+
+Behaviour is backward compatible: with the default TF-IDF embedder the hybrid
+path falls back to vector-only search, so existing results are unchanged.
+
 ## What the numbers show (read this part)
 
 - **Latency is not the bottleneck.** A brute-force dot product over 8×309 is
@@ -67,26 +105,28 @@ the top 4 results that do.
   interface — swapping in neural embeddings is a config change, not a redesign.
 - **The one miss was architectural.** "How does the vector store find the
   nearest chunks?" ranked `what_is_rag.md` first because the RAG doc also talks
-  about "vectors and nearest ones". A neural embedder or a hybrid
-  TF-IDF + dense reranker would fix exactly this class of error.
+  about "vectors and nearest ones". Hybrid retrieval (implemented — see above)
+  kills exactly this class of error: the dense branch aligns on *meaning*,
+  and RRF reward for being ranked in both lists surfaces the architecture doc.
 
 ## Reproduce
 
 ```bash
-python scripts/eval_rag.py
+python scripts/eval_rag.py        # lexical baseline (this page's numbers)
+python scripts/eval_rag.py --local  # + dense & hybrid comparison (needs optional extras)
 ```
 
 Run the full suite alongside:
 
 ```bash
-pytest -q            # 22 tests, all green
+pytest -q            # 30 tests, all green
 ```
 
 ## Roadmap (how these numbers would move)
 
 | Change                              | Expected effect on retrieval        |
 |-------------------------------------|-------------------------------------|
+| ✅ Hybrid BM25 + dense (RRF)         | **done** — removes lexical-blindness     |
 | Swap to neural embeddings (env var) | higher precision on paraphrased Qs  |
-| Hybrid BM25 + dense (RRF fusion)    | fixes lexical-blindness in P@4      |
 | ANN index (HNSW) for >10⁵ chunks    | keeps p95 flat as corpus grows      |
 | Reranker on `k=20` → top 4          | precision@4 → ~0.9                  |

@@ -23,8 +23,11 @@ import numpy as np
 
 from . import db
 from .chunking import Chunk, chunk_text
+from .config import settings
 from .embeddings import Embedder, build_embedder
 from .generator import Generator, build_generator
+from .lexical import LexicalIndex
+from .search import rrf_fuse
 from .store import VectorStore
 
 
@@ -46,6 +49,7 @@ class RagEngine:
     def __init__(self, embedder: Embedder | None = None) -> None:
         self.embedder: Embedder = embedder or build_embedder()
         self.store = VectorStore()
+        self.lexical: LexicalIndex | None = None
         self.generator: Generator | None = None
         self.last_answer: Answer | None = None
         self._fitted = False
@@ -57,6 +61,7 @@ class RagEngine:
         rows = db.load_chunks(user_id)
         if not rows:
             self.store.reset()
+            self.lexical = None
             self._fitted = False
             return
 
@@ -67,6 +72,7 @@ class RagEngine:
         ]
         vectors = np.vstack([r["vector"] for r in rows])
         self._fit_if_needed(chunks)
+        self._build_lexical(chunks)
         self.store.add(chunks, vectors)
         self._fitted = True
 
@@ -92,11 +98,13 @@ class RagEngine:
         if not chunks:
             db.replace_chunks(user_id, [])
             self.store.reset()
+            self.lexical = None
             self._fitted = False
             return 0
 
         texts = [c.text for c in chunks]
         self._fit_if_needed(chunks)
+        self._build_lexical(chunks)
         vectors = self.embedder.transform(texts)
         self.store.add(chunks, vectors)
         db.replace_chunks(
@@ -148,12 +156,49 @@ class RagEngine:
         if fit is not None:
             fit([c.text for c in chunks])
 
+    def _build_lexical(self, chunks: list[Chunk]) -> None:
+        """Always-available sparse index; pairs with the vector store for
+        hybrid retrieval when the embedder is neural (local/openai)."""
+        self.lexical = LexicalIndex()
+        self.lexical.build(chunks)
+
     # ---- query -------------------------------------------------------------
 
     def retrieve(self, question: str, k: int = 4) -> list[dict]:
-        """Return the top-k most relevant chunks with scores."""
+        """Return the top-k most relevant chunks with scores.
+
+        Dispatches on DOCCHAT_SEARCH_MODE:
+
+        - hybrid (default): fuse the neural vector hits and the BM25 hits
+          with RRF. With a TF-IDF embedder there is no neural branch, so this
+          is vector-only — identical to the pre-hybrid behaviour.
+        - sparse: BM25 lexical search only.
+        - dense: the configured vector store only (TF-IDF or neural).
+        """
         if not self._fitted or self.store.size == 0:
             return []
+
+        neural = self.embedder.name in ("openai", "local")
+        mode = settings.search_mode.lower()
+        has_lexical = self.lexical is not None and self.lexical.size > 0
+
+        if mode == "hybrid" and neural and has_lexical:
+            dense = self._dense_hits(question, k)
+            sparse = self._lexical_hits(question, k)
+            by_id = {**{h["chunk_id"]: h for h in sparse},
+                     **{h["chunk_id"]: h for h in dense}}
+            fused = rrf_fuse(
+                [h["chunk_id"] for h in dense],
+                [h["chunk_id"] for h in sparse],
+            )
+            return [by_id[chunk_id] for chunk_id in fused][:k]
+
+        if mode == "sparse" and has_lexical:
+            return self._lexical_hits(question, k)
+
+        return self._dense_hits(question, k)
+
+    def _dense_hits(self, question: str, k: int) -> list[dict]:
         query_vec = self.embedder.transform([question])[0]
         hits = self.store.search(query_vec, k=k)
         return [
@@ -161,6 +206,19 @@ class RagEngine:
                 "doc_id": h.chunk.doc_id,
                 "chunk_id": h.chunk.chunk_id,
                 "score": round(h.score, 4),
+                "text": h.chunk.text,
+            }
+            for h in hits
+        ]
+
+    def _lexical_hits(self, question: str, k: int) -> list[dict]:
+        hits = self.lexical.search(question, k=k)
+        max_score = max((h.score for h in hits), default=0.0) or 1.0
+        return [
+            {
+                "doc_id": h.chunk.doc_id,
+                "chunk_id": h.chunk.chunk_id,
+                "score": round(h.score / max_score, 4),
                 "text": h.chunk.text,
             }
             for h in hits
