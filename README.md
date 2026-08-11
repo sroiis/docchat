@@ -135,6 +135,8 @@ pytest -q          # 22 tests: unit + API + auth + generator
 
 The suite doubles as documentation for each component. CI runs lint
 (`ruff`), backend tests, and a strict frontend build on every push.
+Measured retrieval quality + latency: **[docs/experiments.md](docs/experiments.md)**
+(`python scripts/eval_rag.py` reproduces the numbers).
 
 ## Deployment
 
@@ -155,7 +157,8 @@ app/                FastAPI backend (RAG + auth + persistence)
 frontend/           React SPA (built into frontend/dist, served by FastAPI)
 sample_docs/        demo documents indexed for the demo user
 tests/              pytest suite
-docs/               architecture & deployment guides
+docs/               architecture, experiments & deployment guides
+scripts/            evaluation benchmark (docs/experiments.md)
 Dockerfile          multi-stage (build SPA → run Python app)
 docker-compose.yml  one-command local deployment
 .github/workflows/  CI (lint + tests + frontend build)
